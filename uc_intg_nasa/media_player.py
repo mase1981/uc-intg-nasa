@@ -1,288 +1,4 @@
-"""
-NASA Mission Control Media Player with static icon management.
-
-:copyright: (c) 2025 by Meir Miyara.
-:license: MPL-2.0, see LICENSE for more details.
-"""
-
-import asyncio
-import base64
-import logging
-import os
-import random
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Optional
-import time
-
-import ucapi
-from ucapi import EntityTypes, StatusCodes
-
-from uc_intg_nasa.client import NASAClient
-from uc_intg_nasa.config import Config
-
-_LOG = logging.getLogger(__name__)
-
-CommandHandler = Callable[[ucapi.Entity, str, dict[str, Any] | None], Awaitable[StatusCodes]]
-
-SUPPRESS_MEDIA_COMMANDS = [
-    ucapi.media_player.Commands.PLAY_PAUSE,
-    ucapi.media_player.Commands.SHUFFLE,
-    ucapi.media_player.Commands.REPEAT,
-    ucapi.media_player.Commands.STOP,
-    ucapi.media_player.Commands.FAST_FORWARD,
-    ucapi.media_player.Commands.REWIND,
-    ucapi.media_player.Commands.SEEK,
-    ucapi.media_player.Commands.RECORD,
-    ucapi.media_player.Commands.MY_RECORDINGS,
-    ucapi.media_player.Commands.MUTE_TOGGLE,
-    ucapi.media_player.Commands.MUTE,
-    ucapi.media_player.Commands.UNMUTE,
-    ucapi.media_player.Commands.VOLUME,
-    ucapi.media_player.Commands.VOLUME_UP,
-    ucapi.media_player.Commands.VOLUME_DOWN
-]
-
-
-class StaticIconManager:
-    """Manages static space icons for instant loading."""
-    
-    def __init__(self, base_dir: str):
-        """Initialize the static icon manager."""
-        self.base_dir = Path(base_dir)
-        self.icons_dir = self.base_dir / "uc_intg_nasa" / "icons"
-        self._icon_cache: Dict[str, str] = {}
-        self._category_images: Dict[str, list] = {}
-        self._daily_universe_image: Optional[str] = None
-        self._daily_universe_date: Optional[str] = None
-        
-        self._load_icon_categories()
-        
-        _LOG.info(f"Static Icon Manager initialized with {len(self._icon_cache)} icons")
-    
-    def _load_icon_categories(self):
-        """Load categorized icon lists from the icons directory."""
-        try:
-            if not self.icons_dir.exists():
-                _LOG.warning(f"Icons directory not found: {self.icons_dir}")
-                self._create_fallback_categories()
-                return
-            
-            index_file = self.icons_dir / "image_index.py"
-            if index_file.exists():
-                try:
-                    import importlib.util
-                    spec = importlib.util.spec_from_file_location("image_index", index_file)
-                    index_module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(index_module)
-                    
-                    if hasattr(index_module, 'CATEGORIES'):
-                        self._category_images = index_module.CATEGORIES
-                        _LOG.info(f"Loaded {len(self._category_images)} image categories")
-                except Exception as ex:
-                    _LOG.error(f"Error loading image index: {ex}")
-                    self._scan_icons_directory()
-            else:
-                self._scan_icons_directory()
-                
-        except Exception as ex:
-            _LOG.error(f"Error loading icon categories: {ex}")
-            self._create_fallback_categories()
-    
-    def _scan_icons_directory(self):
-        """Scan icons directory and categorize images."""
-        _LOG.info("Scanning icons directory...")
-        
-        categories = {
-            'earth': [],
-            'space': [],
-            'planets': [],
-            'nebula': [],
-            'galaxy': [],
-            'general': []
-        }
-        
-        for file_path in self.icons_dir.glob("*.jpg"):
-            filename = file_path.name
-            
-            if 'earth' in filename.lower():
-                categories['earth'].append(filename)
-            elif any(word in filename.lower() for word in ['mars', 'jupiter', 'saturn', 'planet']):
-                categories['planets'].append(filename)
-            elif 'nebula' in filename.lower():
-                categories['nebula'].append(filename)
-            elif 'galaxy' in filename.lower():
-                categories['galaxy'].append(filename)
-            elif 'space' in filename.lower():
-                categories['space'].append(filename)
-            else:
-                categories['general'].append(filename)
-        
-        self._category_images = {k: v for k, v in categories.items() if v}
-        _LOG.info(f"Categorized {sum(len(v) for v in categories.values())} images")
-    
-    def _create_fallback_categories(self):
-        """Create fallback icon categories when no icons are available."""
-        _LOG.warning("No icons found, creating fallback categories")
-        self._category_images = {
-            'earth': [],
-            'space': [],
-            'planets': [],
-            'nebula': [],
-            'galaxy': [],
-            'general': []
-        }
-    
-    def get_icon_for_source(self, source_id: str, force_new: bool = False) -> str:
-        """Get appropriate icon for source."""
-        if source_id == "apod":
-            return self._get_daily_universe_icon()
-        
-        category = self._get_category_for_source(source_id)
-        return self._get_random_icon_from_category(category, force_new)
-    
-    def _get_daily_universe_icon(self) -> str:
-        """Get Daily Universe icon - updates daily at 5am local time."""
-        now = datetime.now()
-        today_str = now.strftime("%Y-%m-%d")
-        
-        refresh_time = now.replace(hour=5, minute=0, second=0, microsecond=0)
-        if now < refresh_time:
-            refresh_time -= timedelta(days=1)
-            today_str = refresh_time.strftime("%Y-%m-%d")
-        
-        if self._daily_universe_date != today_str:
-            _LOG.info(f"Refreshing Daily Universe image for {today_str}")
-            self._daily_universe_image = self._get_random_icon_from_category('space', force_new=True)
-            self._daily_universe_date = today_str
-        
-        return self._daily_universe_image or self._get_fallback_icon('apod')
-    
-    def _get_category_for_source(self, source_id: str) -> str:
-        """Map source ID to icon category."""
-        category_map = {
-            'apod': 'space',
-            'epic': 'earth', 
-            'iss': 'space',
-            'neo': 'general',
-            'insight': 'planets',
-            'donki': 'space'
-        }
-        return category_map.get(source_id, 'general')
-    
-    def _get_random_icon_from_category(self, category: str, force_new: bool = False) -> str:
-        """Get random icon from category as base64."""
-        available_images = self._category_images.get(category, [])
-        
-        if not available_images:
-            all_images = []
-            for imgs in self._category_images.values():
-                all_images.extend(imgs)
-            available_images = all_images
-        
-        if not available_images:
-            return self._get_fallback_icon(category)
-        
-        if force_new or category not in self._icon_cache:
-            selected_image = random.choice(available_images)
-            icon_path = self.icons_dir / selected_image
-            
-            if icon_path.exists():
-                try:
-                    with open(icon_path, 'rb') as f:
-                        image_data = f.read()
-                        b64_data = base64.b64encode(image_data).decode('utf-8')
-                        data_url = f"data:image/jpeg;base64,{b64_data}"
-                        self._icon_cache[category] = data_url
-                        _LOG.debug(f"Loaded icon: {selected_image} for {category}")
-                        return data_url
-                except Exception as ex:
-                    _LOG.error(f"Error loading icon {selected_image}: {ex}")
-        
-        return self._icon_cache.get(category, self._get_fallback_icon(category))
-    
-    def _get_fallback_icon(self, source_id: str) -> str:
-        """Get fallback SVG icon when no images available."""
-        fallback_icons = {
-            'apod': self._create_svg_icon("🌌", "#1a1a2e", "Daily Universe"),
-            'epic': self._create_svg_icon("🌍", "#0077be", "Earth Live"),
-            'iss': self._create_svg_icon("🛰️", "#c0c0c0", "ISS Tracker"),
-            'neo': self._create_svg_icon("☄️", "#8b4513", "NEO Watch"),
-            'insight': self._create_svg_icon("🔴", "#cd5c5c", "Mars Archive"),
-            'donki': self._create_svg_icon("☀️", "#ffd700", "Space Weather"),
-            'earth': self._create_svg_icon("🌍", "#0077be", "Earth"),
-            'space': self._create_svg_icon("🌌", "#1a1a2e", "Space"),
-            'planets': self._create_svg_icon("🪐", "#cd5c5c", "Planets"),
-            'nebula': self._create_svg_icon("🌟", "#9932cc", "Nebula"),
-            'galaxy': self._create_svg_icon("🌌", "#4b0082", "Galaxy"),
-            'general': self._create_svg_icon("⭐", "#1a1a2e", "Space")
-        }
-        return fallback_icons.get(source_id, fallback_icons['general'])
-    
-    def _create_svg_icon(self, emoji: str, color: str, text: str) -> str:
-        """Create SVG icon as base64 data URL."""
-        svg_content = f'''<svg width="400" height="300" xmlns="http://www.w3.org/2000/svg">
-            <rect width="100%" height="100%" fill="{color}"/>
-            <text x="50%" y="35%" font-family="Arial" font-size="60" fill="#fff" text-anchor="middle" dy=".3em">{emoji}</text>
-            <text x="50%" y="70%" font-family="Arial" font-size="24" fill="#fff" text-anchor="middle" dy=".3em">{text}</text>
-        </svg>'''
-        
-        b64_svg = base64.b64encode(svg_content.encode('utf-8')).decode('utf-8')
-        return f"data:image/svg+xml;base64,{b64_svg}"
-
-
-class NASAMediaPlayer(ucapi.MediaPlayer):
-    """NASA Mission Control Media Player with static icon management."""
-
-    def __init__(
-        self,
-        config: Config,
-        nasa_client: NASAClient,
-        cmd_handler: CommandHandler | None = None,
-    ):
-        """Initialize the NASA Media Player entity."""
-        self._config = config
-        self._nasa_client = nasa_client
-        self._current_source = "apod"
-        self._update_task: Optional[asyncio.Task] = None
-        self._source_updates: Dict[str, asyncio.Task] = {}
-        self._api: Optional[ucapi.IntegrationAPI] = None
-        self._last_push_time = 0
-        
-        base_dir = os.path.dirname(os.path.dirname(self._config._config_file_path))
-        self._icon_manager = StaticIconManager(base_dir)
-        
-        features = [
-            ucapi.media_player.Features.SELECT_SOURCE,
-            ucapi.media_player.Features.MEDIA_IMAGE_URL,
-            ucapi.media_player.Features.MEDIA_TITLE,
-            ucapi.media_player.Features.MEDIA_ARTIST,
-            ucapi.media_player.Features.ON_OFF,
-            ucapi.media_player.Features.NEXT,
-            ucapi.media_player.Features.PREVIOUS
-        ]
-
-        initial_icon = self._icon_manager.get_icon_for_source(self._current_source)
-        attributes = {
-            ucapi.media_player.Attributes.STATE: ucapi.media_player.States.BUFFERING,
-            ucapi.media_player.Attributes.SOURCE_LIST: config.get_source_list(),
-            ucapi.media_player.Attributes.SOURCE: config.get_source_data(self._current_source)["name"],
-            ucapi.media_player.Attributes.MEDIA_IMAGE_URL: initial_icon,
-            ucapi.media_player.Attributes.MEDIA_TITLE: "NASA Mission Control",
-            ucapi.media_player.Attributes.MEDIA_ARTIST: "Initializing space data feeds..."
-        }
-
-        super().__init__(
-            identifier=config.device_id,
-            name=config.device_name,
-            features=features,
-            attributes=attributes,
-            device_class=ucapi.media_player.DeviceClasses.STREAMING_BOX,
-            cmd_handler=cmd_handler or self._handle_command,
-        )
-
-        _LOG.info("NASA Media Player initialized with static icon system")
-
+# Rest of the media player methods remain the same...
     async def _handle_command(self, entity: ucapi.Entity, cmd_id: str, params: dict[str, Any] | None = None) -> StatusCodes:
         """Handle media player commands."""
         _LOG.debug("COMMAND: %s", cmd_id)
@@ -334,7 +50,6 @@ class NASAMediaPlayer(ucapi.MediaPlayer):
             return StatusCodes.NOT_FOUND
 
         self._current_source = source_id
-        
         static_icon = self._icon_manager.get_icon_for_source(source_id, force_new=True)
         
         _LOG.info(f"SWITCHING TO: {source_name} ({source_id})")
@@ -451,6 +166,9 @@ class NASAMediaPlayer(ucapi.MediaPlayer):
     async def _determine_final_image(self, api_image_url: str, source_id: str) -> str:
         """Determine final image based on source logic."""
         
+    async def _determine_final_image(self, api_image_url: str, source_id: str) -> str:
+        """Determine final image based on source logic."""
+        
         if source_id == "apod" and api_image_url and api_image_url.startswith("http"):
             if not (api_image_url.endswith('.png') and 'epic.gsfc.nasa.gov' in api_image_url):
                 _LOG.info("Using NASA APOD image from API")
@@ -529,4 +247,341 @@ class NASAMediaPlayer(ucapi.MediaPlayer):
     @property
     def current_source_name(self) -> str:
         """Get current source display name."""
-        return self._config.sources[self._current_source]["name"]
+        return self._config.sources[self._current_source]["name"]"""
+NASA Mission Control Media Player with PyInstaller-compatible static icon management.
+
+:copyright: (c) 2025 by Meir Miyara.
+:license: MPL-2.0, see LICENSE for more details.
+"""
+
+import asyncio
+import base64
+import logging
+import os
+import random
+import sys
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, Optional
+import time
+
+import ucapi
+from ucapi import EntityTypes, StatusCodes
+
+from uc_intg_nasa.client import NASAClient
+from uc_intg_nasa.config import Config
+
+_LOG = logging.getLogger(__name__)
+
+CommandHandler = Callable[[ucapi.Entity, str, dict[str, Any] | None], Awaitable[StatusCodes]]
+
+SUPPRESS_MEDIA_COMMANDS = [
+    ucapi.media_player.Commands.PLAY_PAUSE,
+    ucapi.media_player.Commands.SHUFFLE,
+    ucapi.media_player.Commands.REPEAT,
+    ucapi.media_player.Commands.STOP,
+    ucapi.media_player.Commands.FAST_FORWARD,
+    ucapi.media_player.Commands.REWIND,
+    ucapi.media_player.Commands.SEEK,
+    ucapi.media_player.Commands.RECORD,
+    ucapi.media_player.Commands.MY_RECORDINGS,
+    ucapi.media_player.Commands.MUTE_TOGGLE,
+    ucapi.media_player.Commands.MUTE,
+    ucapi.media_player.Commands.UNMUTE,
+    ucapi.media_player.Commands.VOLUME,
+    ucapi.media_player.Commands.VOLUME_UP,
+    ucapi.media_player.Commands.VOLUME_DOWN
+]
+
+
+class StaticIconManager:
+    """Manages static space icons with PyInstaller compatibility."""
+    
+    def __init__(self, base_dir: str):
+        """Initialize the static icon manager with multiple path detection."""
+        self.base_dir = Path(base_dir)
+        
+        # Try multiple possible icon locations for PyInstaller compatibility
+        possible_icon_dirs = [
+            # PyInstaller bundle location (most likely in production)
+            Path(__file__).parent / "icons",
+            # Alternative PyInstaller _internal location  
+            Path(sys.executable).parent / "_internal" / "uc_intg_nasa" / "icons" if getattr(sys, 'frozen', False) else None,
+            # Development location
+            self.base_dir / "uc_intg_nasa" / "icons",
+            # Relative to current working directory
+            Path.cwd() / "uc_intg_nasa" / "icons",
+            # Backup: check if we're in the package itself
+            Path(__file__).parent.parent / "uc_intg_nasa" / "icons"
+        ]
+        
+        # Find the first existing icons directory
+        self.icons_dir = None
+        for icon_dir in possible_icon_dirs:
+            if icon_dir and icon_dir.exists():
+                # Check if it actually contains icons
+                icon_files = list(icon_dir.glob("*.jpg"))
+                if len(icon_files) > 0:
+                    self.icons_dir = icon_dir
+                    _LOG.info(f"✅ Found icons directory: {self.icons_dir} ({len(icon_files)} images)")
+                    break
+                else:
+                    _LOG.debug(f"Directory exists but no .jpg files: {icon_dir}")
+        
+        if not self.icons_dir:
+            _LOG.warning("❌ No icons directory found, will use fallback SVG icons")
+            self.icons_dir = Path("/tmp")  # Dummy path for fallbacks
+        
+        self._icon_cache: Dict[str, str] = {}
+        self._category_images: Dict[str, list] = {}
+        self._daily_universe_image: Optional[str] = None
+        self._daily_universe_date: Optional[str] = None
+        
+        # Load icon categories
+        self._load_icon_categories()
+        
+        _LOG.info(f"🎨 Static Icon Manager initialized with {len(sum(self._category_images.values(), []))} total icons")
+    
+    def _load_icon_categories(self):
+        """Load categorized icon lists from the icons directory."""
+        try:
+            # Check if we have actual icons
+            if not self.icons_dir.exists() or len(list(self.icons_dir.glob("*.jpg"))) == 0:
+                _LOG.warning(f"No icons found in {self.icons_dir}")
+                self._create_fallback_categories()
+                return
+            
+            index_file = self.icons_dir / "image_index.py"
+            if index_file.exists():
+                try:
+                    # Import the index module dynamically
+                    import importlib.util
+                    spec = importlib.util.spec_from_file_location("image_index", index_file)
+                    if spec and spec.loader:
+                        index_module = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(index_module)
+                        
+                        # Load categories from the module
+                        if hasattr(index_module, 'CATEGORIES'):
+                            self._category_images = index_module.CATEGORIES
+                            _LOG.info(f"📋 Loaded {len(self._category_images)} image categories from index")
+                            return
+                        else:
+                            _LOG.warning("image_index.py found but no CATEGORIES defined")
+                    else:
+                        _LOG.warning("Could not load image_index.py spec")
+                except Exception as ex:
+                    _LOG.error(f"Error loading image index: {ex}")
+            
+            # Fallback: scan directory if index failed
+            _LOG.info("📁 Scanning icons directory for categorization...")
+            self._scan_icons_directory()
+                
+        except Exception as ex:
+            _LOG.error(f"Error loading icon categories: {ex}")
+            self._create_fallback_categories()
+    
+    def _scan_icons_directory(self):
+        """Scan icons directory and categorize images."""
+        _LOG.info("🔍 Scanning icons directory...")
+        
+        # Initialize categories
+        categories = {
+            'earth': [],
+            'space': [],
+            'planets': [],
+            'nebula': [],
+            'galaxy': [],
+            'general': []
+        }
+        
+        # Scan for image files
+        for file_path in self.icons_dir.glob("*.jpg"):
+            filename = file_path.name
+            
+            # Categorize based on filename
+            if 'earth' in filename.lower():
+                categories['earth'].append(filename)
+            elif any(word in filename.lower() for word in ['mars', 'jupiter', 'saturn', 'planet']):
+                categories['planets'].append(filename)
+            elif 'nebula' in filename.lower():
+                categories['nebula'].append(filename)
+            elif 'galaxy' in filename.lower():
+                categories['galaxy'].append(filename)
+            elif 'space' in filename.lower():
+                categories['space'].append(filename)
+            else:
+                categories['general'].append(filename)
+        
+        self._category_images = {k: v for k, v in categories.items() if v}
+        total_images = sum(len(v) for v in categories.values())
+        _LOG.info(f"📋 Categorized {total_images} images into {len(self._category_images)} categories")
+    
+    def _create_fallback_categories(self):
+        """Create fallback icon categories when no icons are available."""
+        _LOG.warning("⚠️ No icons found, creating fallback categories")
+        self._category_images = {
+            'earth': [],
+            'space': [],
+            'planets': [],
+            'nebula': [],
+            'galaxy': [],
+            'general': []
+        }
+    
+    def get_icon_for_source(self, source_id: str, force_new: bool = False) -> str:
+        """Get appropriate icon for source."""
+        if source_id == "apod":
+            return self._get_daily_universe_icon()
+        
+        category = self._get_category_for_source(source_id)
+        return self._get_random_icon_from_category(category, force_new)
+    
+    def _get_daily_universe_icon(self) -> str:
+        """Get Daily Universe icon - updates daily at 5am local time."""
+        now = datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
+        
+        refresh_time = now.replace(hour=5, minute=0, second=0, microsecond=0)
+        if now < refresh_time:
+            refresh_time -= timedelta(days=1)
+            today_str = refresh_time.strftime("%Y-%m-%d")
+        
+        if self._daily_universe_date != today_str:
+            _LOG.info(f"🌌 Refreshing Daily Universe image for {today_str}")
+            self._daily_universe_image = self._get_random_icon_from_category('space', force_new=True)
+            self._daily_universe_date = today_str
+        
+        return self._daily_universe_image or self._get_fallback_icon('apod')
+    
+    def _get_category_for_source(self, source_id: str) -> str:
+        """Map source ID to icon category."""
+        category_map = {
+            'apod': 'space',
+            'epic': 'earth', 
+            'iss': 'space',
+            'neo': 'general',
+            'insight': 'planets',
+            'donki': 'space'
+        }
+        return category_map.get(source_id, 'general')
+    
+    def _get_random_icon_from_category(self, category: str, force_new: bool = False) -> str:
+        """Get random icon from category as base64."""
+        available_images = self._category_images.get(category, [])
+        
+        # Fallback to any available images if category is empty
+        if not available_images:
+            all_images = []
+            for imgs in self._category_images.values():
+                all_images.extend(imgs)
+            available_images = all_images
+        
+        if not available_images:
+            _LOG.debug(f"No images available for category {category}, using fallback")
+            return self._get_fallback_icon(category)
+        
+        # Select random image
+        if force_new or category not in self._icon_cache:
+            selected_image = random.choice(available_images)
+            icon_path = self.icons_dir / selected_image
+            
+            if icon_path.exists():
+                try:
+                    with open(icon_path, 'rb') as f:
+                        image_data = f.read()
+                        b64_data = base64.b64encode(image_data).decode('utf-8')
+                        data_url = f"data:image/jpeg;base64,{b64_data}"
+                        self._icon_cache[category] = data_url
+                        _LOG.debug(f"🎨 Loaded icon: {selected_image} for {category}")
+                        return data_url
+                except Exception as ex:
+                    _LOG.error(f"Error loading icon {selected_image}: {ex}")
+        
+        # Return cached or fallback
+        return self._icon_cache.get(category, self._get_fallback_icon(category))
+    
+    def _get_fallback_icon(self, source_id: str) -> str:
+        """Get fallback SVG icon when no images available."""
+        fallback_icons = {
+            'apod': self._create_svg_icon("🌌", "#1a1a2e", "Daily Universe"),
+            'epic': self._create_svg_icon("🌍", "#0077be", "Earth Live"),
+            'iss': self._create_svg_icon("🛰️", "#c0c0c0", "ISS Tracker"),
+            'neo': self._create_svg_icon("☄️", "#8b4513", "NEO Watch"),
+            'insight': self._create_svg_icon("🔴", "#cd5c5c", "Mars Archive"),
+            'donki': self._create_svg_icon("☀️", "#ffd700", "Space Weather"),
+            'earth': self._create_svg_icon("🌍", "#0077be", "Earth"),
+            'space': self._create_svg_icon("🌌", "#1a1a2e", "Space"),
+            'planets': self._create_svg_icon("🪐", "#cd5c5c", "Planets"),
+            'nebula': self._create_svg_icon("🌟", "#9932cc", "Nebula"),
+            'galaxy': self._create_svg_icon("🌌", "#4b0082", "Galaxy"),
+            'general': self._create_svg_icon("⭐", "#1a1a2e", "Space")
+        }
+        return fallback_icons.get(source_id, fallback_icons['general'])
+    
+    def _create_svg_icon(self, emoji: str, color: str, text: str) -> str:
+        """Create SVG icon as base64 data URL."""
+        svg_content = f'''<svg width="400" height="300" xmlns="http://www.w3.org/2000/svg">
+            <rect width="100%" height="100%" fill="{color}"/>
+            <text x="50%" y="35%" font-family="Arial" font-size="60" fill="#fff" text-anchor="middle" dy=".3em">{emoji}</text>
+            <text x="50%" y="70%" font-family="Arial" font-size="24" fill="#fff" text-anchor="middle" dy=".3em">{text}</text>
+        </svg>'''
+        
+        b64_svg = base64.b64encode(svg_content.encode('utf-8')).decode('utf-8')
+        return f"data:image/svg+xml;base64,{b64_svg}"
+
+
+class NASAMediaPlayer(ucapi.MediaPlayer):
+    """NASA Mission Control Media Player with PyInstaller-compatible static icons."""
+
+    def __init__(
+        self,
+        config: Config,
+        nasa_client: NASAClient,
+        cmd_handler: CommandHandler | None = None,
+    ):
+        """Initialize the NASA Media Player entity."""
+        self._config = config
+        self._nasa_client = nasa_client
+        self._current_source = "apod"
+        self._update_task: Optional[asyncio.Task] = None
+        self._source_updates: Dict[str, asyncio.Task] = {}
+        self._api: Optional[ucapi.IntegrationAPI] = None
+        self._last_push_time = 0
+        
+        # Initialize static icon manager with PyInstaller compatibility
+        # Don't rely on config path - let the icon manager find the icons
+        self._icon_manager = StaticIconManager("")  # Empty base dir - let it auto-detect
+        
+        features = [
+            ucapi.media_player.Features.SELECT_SOURCE,
+            ucapi.media_player.Features.MEDIA_IMAGE_URL,
+            ucapi.media_player.Features.MEDIA_TITLE,
+            ucapi.media_player.Features.MEDIA_ARTIST,
+            ucapi.media_player.Features.ON_OFF,
+            ucapi.media_player.Features.NEXT,
+            ucapi.media_player.Features.PREVIOUS
+        ]
+
+        initial_icon = self._icon_manager.get_icon_for_source(self._current_source)
+        attributes = {
+            ucapi.media_player.Attributes.STATE: ucapi.media_player.States.BUFFERING,
+            ucapi.media_player.Attributes.SOURCE_LIST: config.get_source_list(),
+            ucapi.media_player.Attributes.SOURCE: config.get_source_data(self._current_source)["name"],
+            ucapi.media_player.Attributes.MEDIA_IMAGE_URL: initial_icon,
+            ucapi.media_player.Attributes.MEDIA_TITLE: "NASA Mission Control",
+            ucapi.media_player.Attributes.MEDIA_ARTIST: "Initializing space data feeds..."
+        }
+
+        super().__init__(
+            identifier=config.device_id,
+            name=config.device_name,
+            features=features,
+            attributes=attributes,
+            device_class=ucapi.media_player.DeviceClasses.STREAMING_BOX,
+            cmd_handler=cmd_handler or self._handle_command,
+        )
+
+        _LOG.info("🚀 NASA Media Player initialized with PyInstaller-compatible icon system")
+
+    # ... [Rest of the media player methods remain the same as before]
