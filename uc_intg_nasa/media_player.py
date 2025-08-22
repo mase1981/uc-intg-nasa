@@ -1,253 +1,4 @@
-# Rest of the media player methods remain the same...
-    async def _handle_command(self, entity: ucapi.Entity, cmd_id: str, params: dict[str, Any] | None = None) -> StatusCodes:
-        """Handle media player commands."""
-        _LOG.debug("COMMAND: %s", cmd_id)
-
-        try:
-            if cmd_id == ucapi.media_player.Commands.ON:
-                return await self._cmd_on()
-            elif cmd_id == ucapi.media_player.Commands.OFF:
-                return await self._cmd_off()
-            elif cmd_id == ucapi.media_player.Commands.SELECT_SOURCE:
-                return await self._cmd_select_source_instant(params)
-            elif cmd_id == ucapi.media_player.Commands.NEXT:
-                return await self._cmd_next_source_instant()
-            elif cmd_id == ucapi.media_player.Commands.PREVIOUS:
-                return await self._cmd_previous_source_instant()
-            elif cmd_id in SUPPRESS_MEDIA_COMMANDS:
-                _LOG.debug("Ignoring command '%s'", cmd_id)
-                return StatusCodes.OK
-            else:
-                _LOG.warning("Unexpected command: %s", cmd_id)
-                return StatusCodes.NOT_IMPLEMENTED
-
-        except Exception as ex:
-            _LOG.error("Error handling command %s: %s", cmd_id, ex)
-            return StatusCodes.SERVER_ERROR
-
-    async def _cmd_on(self) -> StatusCodes:
-        """Turn on."""
-        self.attributes[ucapi.media_player.Attributes.STATE] = ucapi.media_player.States.PLAYING
-        asyncio.create_task(self._push_update_throttled())
-        return StatusCodes.OK
-
-    async def _cmd_off(self) -> StatusCodes:
-        """Turn off."""
-        self.attributes[ucapi.media_player.Attributes.STATE] = ucapi.media_player.States.OFF
-        await self._stop_all_updates()
-        asyncio.create_task(self._push_update_throttled())
-        return StatusCodes.OK
-
-    async def _cmd_select_source_instant(self, params: dict[str, Any] | None = None) -> StatusCodes:
-        """Instant source selection with different static icons."""
-        if not params or "source" not in params:
-            return StatusCodes.BAD_REQUEST
-
-        source_name = params["source"]
-        source_id = self._config.get_source_by_name(source_name)
-        
-        if not source_id:
-            return StatusCodes.NOT_FOUND
-
-        self._current_source = source_id
-        static_icon = self._icon_manager.get_icon_for_source(source_id, force_new=True)
-        
-        _LOG.info(f"SWITCHING TO: {source_name} ({source_id})")
-        
-        self.attributes[ucapi.media_player.Attributes.SOURCE] = source_name
-        self.attributes[ucapi.media_player.Attributes.STATE] = ucapi.media_player.States.BUFFERING
-        self.attributes[ucapi.media_player.Attributes.MEDIA_IMAGE_URL] = static_icon
-        self.attributes[ucapi.media_player.Attributes.MEDIA_TITLE] = f"Loading {source_name}..."
-        self.attributes[ucapi.media_player.Attributes.MEDIA_ARTIST] = "Fetching live NASA data..."
-        
-        asyncio.create_task(self._push_update_throttled())
-        asyncio.create_task(self._update_source_background(source_id))
-        
-        return StatusCodes.OK
-
-    async def _cmd_next_source_instant(self) -> StatusCodes:
-        """Instant next source."""
-        source_ids = list(self._config.sources.keys())
-        current_index = source_ids.index(self._current_source)
-        next_index = (current_index + 1) % len(source_ids)
-        next_source_id = source_ids[next_index]
-        
-        source_name = self._config.sources[next_source_id]["name"]
-        
-        self._current_source = next_source_id
-        static_icon = self._icon_manager.get_icon_for_source(next_source_id, force_new=True)
-        
-        self.attributes[ucapi.media_player.Attributes.SOURCE] = source_name
-        self.attributes[ucapi.media_player.Attributes.STATE] = ucapi.media_player.States.BUFFERING
-        self.attributes[ucapi.media_player.Attributes.MEDIA_IMAGE_URL] = static_icon
-        self.attributes[ucapi.media_player.Attributes.MEDIA_TITLE] = f"Loading {source_name}..."
-        self.attributes[ucapi.media_player.Attributes.MEDIA_ARTIST] = "Fetching live NASA data..."
-        
-        asyncio.create_task(self._push_update_throttled())
-        asyncio.create_task(self._update_source_background(next_source_id))
-        
-        return StatusCodes.OK
-
-    async def _cmd_previous_source_instant(self) -> StatusCodes:
-        """Instant previous source."""
-        source_ids = list(self._config.sources.keys())
-        current_index = source_ids.index(self._current_source)
-        prev_index = (current_index - 1) % len(source_ids)
-        prev_source_id = source_ids[prev_index]
-        
-        source_name = self._config.sources[prev_source_id]["name"]
-        
-        self._current_source = prev_source_id
-        static_icon = self._icon_manager.get_icon_for_source(prev_source_id, force_new=True)
-        
-        self.attributes[ucapi.media_player.Attributes.SOURCE] = source_name
-        self.attributes[ucapi.media_player.Attributes.STATE] = ucapi.media_player.States.BUFFERING
-        self.attributes[ucapi.media_player.Attributes.MEDIA_IMAGE_URL] = static_icon
-        self.attributes[ucapi.media_player.Attributes.MEDIA_TITLE] = f"Loading {source_name}..."
-        self.attributes[ucapi.media_player.Attributes.MEDIA_ARTIST] = "Fetching live NASA data..."
-        
-        asyncio.create_task(self._push_update_throttled())
-        asyncio.create_task(self._update_source_background(prev_source_id))
-        
-        return StatusCodes.OK
-
-    async def _update_source_background(self, source_id: str) -> None:
-        """Update source data in background."""
-        if source_id in self._source_updates:
-            self._source_updates[source_id].cancel()
-        
-        update_task = asyncio.create_task(self._fetch_and_update_source(source_id))
-        self._source_updates[source_id] = update_task
-        
-        try:
-            await update_task
-        except asyncio.CancelledError:
-            pass
-        except Exception as ex:
-            _LOG.error("Background update error for %s: %s", source_id, ex)
-        finally:
-            self._source_updates.pop(source_id, None)
-
-    async def _fetch_and_update_source(self, source_id: str) -> None:
-        """Fetch NASA text data and update display."""
-        try:
-            _LOG.info("FETCHING DATA: %s", source_id)
-            
-            api_image_url, title, description = await self._nasa_client.fetch_source_data(source_id)
-            
-            if self._current_source == source_id:
-                final_image_url = await self._determine_final_image(api_image_url, source_id)
-                
-                _LOG.info("TITLE: %s", title)
-                _LOG.info("DESC: %s", description[:50])
-                
-                self.attributes.update({
-                    ucapi.media_player.Attributes.STATE: ucapi.media_player.States.PLAYING,
-                    ucapi.media_player.Attributes.MEDIA_IMAGE_URL: final_image_url,
-                    ucapi.media_player.Attributes.MEDIA_TITLE: title or "Unknown",
-                    ucapi.media_player.Attributes.MEDIA_ARTIST: description or "No description available"
-                })
-                
-                await self._push_update_force()
-                
-        except Exception as ex:
-            _LOG.error("Error fetching %s: %s", source_id, ex)
-            
-            if self._current_source == source_id:
-                static_icon = self._icon_manager.get_icon_for_source(source_id)
-                self.attributes.update({
-                    ucapi.media_player.Attributes.STATE: ucapi.media_player.States.PLAYING,
-                    ucapi.media_player.Attributes.MEDIA_IMAGE_URL: static_icon,
-                    ucapi.media_player.Attributes.MEDIA_TITLE: f"{source_id.upper()} Monitor",
-                    ucapi.media_player.Attributes.MEDIA_ARTIST: "Data temporarily unavailable"
-                })
-                await self._push_update_force()
-
-    async def _determine_final_image(self, api_image_url: str, source_id: str) -> str:
-        """Determine final image based on source logic."""
-        
-    async def _determine_final_image(self, api_image_url: str, source_id: str) -> str:
-        """Determine final image based on source logic."""
-        
-        if source_id == "apod" and api_image_url and api_image_url.startswith("http"):
-            if not (api_image_url.endswith('.png') and 'epic.gsfc.nasa.gov' in api_image_url):
-                _LOG.info("Using NASA APOD image from API")
-                return api_image_url
-        
-        static_icon = self._icon_manager.get_icon_for_source(source_id)
-        _LOG.info(f"Using static icon for {source_id}")
-        return static_icon
-
-    async def _push_update_throttled(self) -> None:
-        """Push update with throttling."""
-        now = time.time()
-        
-        if now - self._last_push_time < 0.2:
-            return
-        
-        self._last_push_time = now
-        await self._push_update()
-
-    async def _push_update(self) -> None:
-        """Push state update to the remote."""
-        try:
-            if self._api and self._api.configured_entities.contains(self.id):
-                self._api.configured_entities.update_attributes(self.id, self.attributes)
-        except Exception as ex:
-            _LOG.error("Error pushing update: %s", ex)
-
-    async def _push_update_force(self) -> None:
-        """Force push state update."""
-        try:
-            if self._api and self._api.configured_entities.contains(self.id):
-                _LOG.info("UPDATE: %s -> %s", 
-                         self.attributes[ucapi.media_player.Attributes.SOURCE],
-                         self.attributes[ucapi.media_player.Attributes.MEDIA_TITLE])
-                
-                self._api.configured_entities.update_attributes(self.id, self.attributes)
-        except Exception as ex:
-            _LOG.error("Error in force push update: %s", ex)
-
-    async def push_initial_state(self) -> None:
-        """Push initial state."""
-        _LOG.debug("Pushing initial state to remote")
-        
-        import ucapi
-        if hasattr(ucapi, '_current_api'):
-            self._api = ucapi._current_api
-        
-        await self._push_update()
-        asyncio.create_task(self._update_source_background(self._current_source))
-
-    async def _stop_all_updates(self) -> None:
-        """Stop all running update tasks."""
-        for task in self._source_updates.values():
-            if not task.done():
-                task.cancel()
-        self._source_updates.clear()
-        
-        if self._update_task and not self._update_task.done():
-            self._update_task.cancel()
-
-    async def shutdown(self) -> None:
-        """Shutdown the media player and cleanup."""
-        _LOG.debug("Shutting down NASA Mission Control media player")
-        await self._stop_all_updates()
-
-    @property
-    def entity_id(self) -> str:
-        """Get entity ID."""
-        return self.id
-
-    @property
-    def current_source(self) -> str:
-        """Get current source ID."""
-        return self._current_source
-
-    @property
-    def current_source_name(self) -> str:
-        """Get current source display name."""
-        return self._config.sources[self._current_source]["name"]"""
+"""
 NASA Mission Control Media Player with PyInstaller-compatible static icon management.
 
 :copyright: (c) 2025 by Meir Miyara.
@@ -329,7 +80,7 @@ class StaticIconManager:
                     _LOG.debug(f"Directory exists but no .jpg files: {icon_dir}")
         
         if not self.icons_dir:
-            _LOG.warning("❌ No icons directory found, will use fallback SVG icons")
+            _LOG.warning("⚠️ No icons directory found, will use fallback SVG icons")
             self.icons_dir = Path("/tmp")  # Dummy path for fallbacks
         
         self._icon_cache: Dict[str, str] = {}
@@ -374,7 +125,7 @@ class StaticIconManager:
                     _LOG.error(f"Error loading image index: {ex}")
             
             # Fallback: scan directory if index failed
-            _LOG.info("📁 Scanning icons directory for categorization...")
+            _LOG.info("🔍 Scanning icons directory for categorization...")
             self._scan_icons_directory()
                 
         except Exception as ex:
@@ -582,6 +333,251 @@ class NASAMediaPlayer(ucapi.MediaPlayer):
             cmd_handler=cmd_handler or self._handle_command,
         )
 
-        _LOG.info("🚀 NASA Media Player initialized with PyInstaller-compatible icon system")
+        _LOG.info("🚀 NASA Media Player initialized with static icon system")
 
-    # ... [Rest of the media player methods remain the same as before]
+    async def _handle_command(self, entity: ucapi.Entity, cmd_id: str, params: dict[str, Any] | None = None) -> StatusCodes:
+        """Handle media player commands."""
+        _LOG.debug("COMMAND: %s", cmd_id)
+
+        try:
+            if cmd_id == ucapi.media_player.Commands.ON:
+                return await self._cmd_on()
+            elif cmd_id == ucapi.media_player.Commands.OFF:
+                return await self._cmd_off()
+            elif cmd_id == ucapi.media_player.Commands.SELECT_SOURCE:
+                return await self._cmd_select_source_instant(params)
+            elif cmd_id == ucapi.media_player.Commands.NEXT:
+                return await self._cmd_next_source_instant()
+            elif cmd_id == ucapi.media_player.Commands.PREVIOUS:
+                return await self._cmd_previous_source_instant()
+            elif cmd_id in SUPPRESS_MEDIA_COMMANDS:
+                _LOG.debug("Ignoring command '%s'", cmd_id)
+                return StatusCodes.OK
+            else:
+                _LOG.warning("Unexpected command: %s", cmd_id)
+                return StatusCodes.NOT_IMPLEMENTED
+
+        except Exception as ex:
+            _LOG.error("Error handling command %s: %s", cmd_id, ex)
+            return StatusCodes.SERVER_ERROR
+
+    async def _cmd_on(self) -> StatusCodes:
+        """Turn on."""
+        self.attributes[ucapi.media_player.Attributes.STATE] = ucapi.media_player.States.PLAYING
+        asyncio.create_task(self._push_update_throttled())
+        return StatusCodes.OK
+
+    async def _cmd_off(self) -> StatusCodes:
+        """Turn off."""
+        self.attributes[ucapi.media_player.Attributes.STATE] = ucapi.media_player.States.OFF
+        await self._stop_all_updates()
+        asyncio.create_task(self._push_update_throttled())
+        return StatusCodes.OK
+
+    async def _cmd_select_source_instant(self, params: dict[str, Any] | None = None) -> StatusCodes:
+        """Instant source selection with different static icons."""
+        if not params or "source" not in params:
+            return StatusCodes.BAD_REQUEST
+
+        source_name = params["source"]
+        source_id = self._config.get_source_by_name(source_name)
+        
+        if not source_id:
+            return StatusCodes.NOT_FOUND
+
+        self._current_source = source_id
+        static_icon = self._icon_manager.get_icon_for_source(source_id, force_new=True)
+        
+        _LOG.info(f"SWITCHING TO: {source_name} ({source_id})")
+        
+        self.attributes[ucapi.media_player.Attributes.SOURCE] = source_name
+        self.attributes[ucapi.media_player.Attributes.STATE] = ucapi.media_player.States.BUFFERING
+        self.attributes[ucapi.media_player.Attributes.MEDIA_IMAGE_URL] = static_icon
+        self.attributes[ucapi.media_player.Attributes.MEDIA_TITLE] = f"Loading {source_name}..."
+        self.attributes[ucapi.media_player.Attributes.MEDIA_ARTIST] = "Fetching live NASA data..."
+        
+        asyncio.create_task(self._push_update_throttled())
+        asyncio.create_task(self._update_source_background(source_id))
+        
+        return StatusCodes.OK
+
+    async def _cmd_next_source_instant(self) -> StatusCodes:
+        """Instant next source."""
+        source_ids = list(self._config.sources.keys())
+        current_index = source_ids.index(self._current_source)
+        next_index = (current_index + 1) % len(source_ids)
+        next_source_id = source_ids[next_index]
+        
+        source_name = self._config.sources[next_source_id]["name"]
+        
+        self._current_source = next_source_id
+        static_icon = self._icon_manager.get_icon_for_source(next_source_id, force_new=True)
+        
+        self.attributes[ucapi.media_player.Attributes.SOURCE] = source_name
+        self.attributes[ucapi.media_player.Attributes.STATE] = ucapi.media_player.States.BUFFERING
+        self.attributes[ucapi.media_player.Attributes.MEDIA_IMAGE_URL] = static_icon
+        self.attributes[ucapi.media_player.Attributes.MEDIA_TITLE] = f"Loading {source_name}..."
+        self.attributes[ucapi.media_player.Attributes.MEDIA_ARTIST] = "Fetching live NASA data..."
+        
+        asyncio.create_task(self._push_update_throttled())
+        asyncio.create_task(self._update_source_background(next_source_id))
+        
+        return StatusCodes.OK
+
+    async def _cmd_previous_source_instant(self) -> StatusCodes:
+        """Instant previous source."""
+        source_ids = list(self._config.sources.keys())
+        current_index = source_ids.index(self._current_source)
+        prev_index = (current_index - 1) % len(source_ids)
+        prev_source_id = source_ids[prev_index]
+        
+        source_name = self._config.sources[prev_source_id]["name"]
+        
+        self._current_source = prev_source_id
+        static_icon = self._icon_manager.get_icon_for_source(prev_source_id, force_new=True)
+        
+        self.attributes[ucapi.media_player.Attributes.SOURCE] = source_name
+        self.attributes[ucapi.media_player.Attributes.STATE] = ucapi.media_player.States.BUFFERING
+        self.attributes[ucapi.media_player.Attributes.MEDIA_IMAGE_URL] = static_icon
+        self.attributes[ucapi.media_player.Attributes.MEDIA_TITLE] = f"Loading {source_name}..."
+        self.attributes[ucapi.media_player.Attributes.MEDIA_ARTIST] = "Fetching live NASA data..."
+        
+        asyncio.create_task(self._push_update_throttled())
+        asyncio.create_task(self._update_source_background(prev_source_id))
+        
+        return StatusCodes.OK
+
+    async def _update_source_background(self, source_id: str) -> None:
+        """Update source data in background."""
+        if source_id in self._source_updates:
+            self._source_updates[source_id].cancel()
+        
+        update_task = asyncio.create_task(self._fetch_and_update_source(source_id))
+        self._source_updates[source_id] = update_task
+        
+        try:
+            await update_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as ex:
+            _LOG.error("Background update error for %s: %s", source_id, ex)
+        finally:
+            self._source_updates.pop(source_id, None)
+
+    async def _fetch_and_update_source(self, source_id: str) -> None:
+        """Fetch NASA text data and update display."""
+        try:
+            _LOG.info("FETCHING DATA: %s", source_id)
+            
+            api_image_url, title, description = await self._nasa_client.fetch_source_data(source_id)
+            
+            if self._current_source == source_id:
+                final_image_url = await self._determine_final_image(api_image_url, source_id)
+                
+                _LOG.info("TITLE: %s", title)
+                _LOG.info("DESC: %s", description[:50])
+                
+                self.attributes.update({
+                    ucapi.media_player.Attributes.STATE: ucapi.media_player.States.PLAYING,
+                    ucapi.media_player.Attributes.MEDIA_IMAGE_URL: final_image_url,
+                    ucapi.media_player.Attributes.MEDIA_TITLE: title or "Unknown",
+                    ucapi.media_player.Attributes.MEDIA_ARTIST: description or "No description available"
+                })
+                
+                await self._push_update_force()
+                
+        except Exception as ex:
+            _LOG.error("Error fetching %s: %s", source_id, ex)
+            
+            if self._current_source == source_id:
+                static_icon = self._icon_manager.get_icon_for_source(source_id)
+                self.attributes.update({
+                    ucapi.media_player.Attributes.STATE: ucapi.media_player.States.PLAYING,
+                    ucapi.media_player.Attributes.MEDIA_IMAGE_URL: static_icon,
+                    ucapi.media_player.Attributes.MEDIA_TITLE: f"{source_id.upper()} Monitor",
+                    ucapi.media_player.Attributes.MEDIA_ARTIST: "Data temporarily unavailable"
+                })
+                await self._push_update_force()
+
+    async def _determine_final_image(self, api_image_url: str, source_id: str) -> str:
+        """Determine final image based on source logic."""
+        
+        if source_id == "apod" and api_image_url and api_image_url.startswith("http"):
+            if not (api_image_url.endswith('.png') and 'epic.gsfc.nasa.gov' in api_image_url):
+                _LOG.info("Using NASA APOD image from API")
+                return api_image_url
+        
+        static_icon = self._icon_manager.get_icon_for_source(source_id)
+        _LOG.info(f"Using static icon for {source_id}")
+        return static_icon
+
+    async def _push_update_throttled(self) -> None:
+        """Push update with throttling."""
+        now = time.time()
+        
+        if now - self._last_push_time < 0.2:
+            return
+        
+        self._last_push_time = now
+        await self._push_update()
+
+    async def _push_update(self) -> None:
+        """Push state update to the remote."""
+        try:
+            if self._api and self._api.configured_entities.contains(self.id):
+                self._api.configured_entities.update_attributes(self.id, self.attributes)
+        except Exception as ex:
+            _LOG.error("Error pushing update: %s", ex)
+
+    async def _push_update_force(self) -> None:
+        """Force push state update."""
+        try:
+            if self._api and self._api.configured_entities.contains(self.id):
+                _LOG.info("UPDATE: %s -> %s", 
+                         self.attributes[ucapi.media_player.Attributes.SOURCE],
+                         self.attributes[ucapi.media_player.Attributes.MEDIA_TITLE])
+                
+                self._api.configured_entities.update_attributes(self.id, self.attributes)
+        except Exception as ex:
+            _LOG.error("Error in force push update: %s", ex)
+
+    async def push_initial_state(self) -> None:
+        """Push initial state."""
+        _LOG.debug("Pushing initial state to remote")
+        
+        import ucapi
+        if hasattr(ucapi, '_current_api'):
+            self._api = ucapi._current_api
+        
+        await self._push_update()
+        asyncio.create_task(self._update_source_background(self._current_source))
+
+    async def _stop_all_updates(self) -> None:
+        """Stop all running update tasks."""
+        for task in self._source_updates.values():
+            if not task.done():
+                task.cancel()
+        self._source_updates.clear()
+        
+        if self._update_task and not self._update_task.done():
+            self._update_task.cancel()
+
+    async def shutdown(self) -> None:
+        """Shutdown the media player and cleanup."""
+        _LOG.debug("Shutting down NASA Mission Control media player")
+        await self._stop_all_updates()
+
+    @property
+    def entity_id(self) -> str:
+        """Get entity ID."""
+        return self.id
+
+    @property
+    def current_source(self) -> str:
+        """Get current source ID."""
+        return self._current_source
+
+    @property
+    def current_source_name(self) -> str:
+        """Get current source display name."""
+        return self._config.sources[self._current_source]["name"]
