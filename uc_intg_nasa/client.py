@@ -1,5 +1,5 @@
 """
-NASA API client for accessing live NASA data feeds.
+NASA API client for accessing live NASA data feeds - FIXED NETWORKING.
 
 :copyright: (c) 2025 by Meir Miyara.
 :license: MPL-2.0, see LICENSE for more details.
@@ -7,12 +7,14 @@ NASA API client for accessing live NASA data feeds.
 
 import asyncio
 import logging
+import ssl
 import time
 import random
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
 
 import aiohttp
+import certifi
 
 from uc_intg_nasa.config import Config
 
@@ -20,7 +22,7 @@ _LOG = logging.getLogger(__name__)
 
 
 class NASAClient:
-    """NASA API client for live data with intelligent caching."""
+    """NASA API client for live data with intelligent caching and robust networking."""
 
     CACHE_INTERVALS = {
         "apod": 6 * 3600,       # 6 hours
@@ -48,10 +50,48 @@ class NASAClient:
         await self.close()
 
     async def _ensure_session(self) -> None:
-        """Ensure aiohttp session exists."""
+        """Ensure aiohttp session exists with robust networking config."""
         if self._session is None or self._session.closed:
-            timeout = aiohttp.ClientTimeout(total=3, connect=1)
-            self._session = aiohttp.ClientSession(timeout=timeout)
+            # Create SSL context with proper certificate handling
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            ssl_context.check_hostname = True
+            ssl_context.verify_mode = ssl.CERT_REQUIRED
+            
+            # Create connector with SSL and connection pooling
+            connector = aiohttp.TCPConnector(
+                ssl=ssl_context,
+                limit=10,
+                limit_per_host=5,
+                ttl_dns_cache=300,
+                use_dns_cache=True,
+                keepalive_timeout=30,
+                enable_cleanup_closed=True
+            )
+            
+            # Timeout configuration - more generous for NASA APIs
+            timeout = aiohttp.ClientTimeout(
+                total=15,
+                connect=5,
+                sock_read=10
+            )
+            
+            # Headers to identify as legitimate client
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Unfolded Circle NASA Integration) AppleWebKit/537.36',
+                'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1'
+            }
+            
+            self._session = aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector,
+                headers=headers
+            )
+            
+            _LOG.info("🌐 NASA HTTP session created with SSL verification")
 
     async def close(self) -> None:
         """Close the HTTP session."""
@@ -81,23 +121,75 @@ class NASAClient:
             "cached_at": time.time()
         }
 
-    async def _make_request(self, url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
-        """Make HTTP request with timeout handling."""
+    async def _make_request(self, url: str, params: Optional[Dict[str, Any]] = None, headers: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
+        """Make HTTP request with robust error handling and retries."""
         await self._ensure_session()
         
-        try:
-            async with self._session.get(url, params=params) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    _LOG.debug("HTTP %d for %s", response.status, url)
-                    return None
-        except asyncio.TimeoutError:
-            _LOG.debug("Timeout for %s", url)
-            return None
-        except Exception as ex:
-            _LOG.debug("Request failed for %s: %s", url, str(ex)[:50])
-            return None
+        # Merge additional headers with session headers
+        request_headers = {}
+        if headers:
+            request_headers.update(headers)
+        
+        for attempt in range(2):  # 2 attempts
+            try:
+                _LOG.debug(f"Making request to {url} (attempt {attempt + 1})")
+                
+                async with self._session.get(url, params=params, headers=request_headers) as response:
+                    _LOG.debug(f"Response: HTTP {response.status} from {url}")
+                    
+                    if response.status == 200:
+                        content_type = response.headers.get('content-type', '')
+                        if 'application/json' in content_type:
+                            return await response.json()
+                        else:
+                            # Some NASA APIs return JSON without proper content-type
+                            text = await response.text()
+                            if text.strip().startswith('{') or text.strip().startswith('['):
+                                try:
+                                    import json
+                                    return json.loads(text)
+                                except json.JSONDecodeError:
+                                    _LOG.debug(f"Invalid JSON from {url}: {text[:100]}")
+                                    return None
+                            else:
+                                _LOG.debug(f"Non-JSON response from {url}: {text[:100]}")
+                                return None
+                    elif response.status == 429:
+                        _LOG.warning(f"Rate limited by {url}")
+                        if attempt == 0:
+                            await asyncio.sleep(2)
+                            continue
+                        return None
+                    elif response.status in [403, 401]:
+                        _LOG.warning(f"Authentication error {response.status} for {url}")
+                        return None
+                    else:
+                        _LOG.debug(f"HTTP {response.status} for {url}")
+                        if attempt == 0:
+                            await asyncio.sleep(1)
+                            continue
+                        return None
+                        
+            except asyncio.TimeoutError:
+                _LOG.debug(f"Timeout for {url} (attempt {attempt + 1})")
+                if attempt == 0:
+                    await asyncio.sleep(1)
+                    continue
+                return None
+            except aiohttp.ClientConnectorError as ex:
+                _LOG.debug(f"Connection error for {url}: {ex}")
+                if attempt == 0:
+                    await asyncio.sleep(1)
+                    continue
+                return None
+            except aiohttp.ClientError as ex:
+                _LOG.debug(f"Client error for {url}: {ex}")
+                return None
+            except Exception as ex:
+                _LOG.error(f"Unexpected error for {url}: {ex}")
+                return None
+        
+        return None
 
     async def fetch_apod_data(self) -> Tuple[str, str, str]:
         """Fetch APOD data - astronomy picture and description."""
@@ -111,7 +203,7 @@ class NASAClient:
         params = {"api_key": self._get_api_key()}
         data = await self._make_request("https://api.nasa.gov/planetary/apod", params)
         
-        if data:
+        if data and isinstance(data, dict):
             try:
                 image_url = data.get("hdurl") or data.get("url")
                 raw_title = data.get("title", "")
@@ -287,7 +379,7 @@ class NASAClient:
         params = {"api_key": self._get_api_key()}
         data = await self._make_request("https://api.nasa.gov/neo/rest/v1/feed/today", params)
         
-        if data:
+        if data and isinstance(data, dict):
             try:
                 neo_count = data.get("element_count", 0)
                 date_keys = list(data.get("near_earth_objects", {}).keys())
@@ -547,7 +639,7 @@ class NASAClient:
                 
                 method = fetch_methods.get(source_id)
                 if method:
-                    result = await asyncio.wait_for(method(), timeout=5)
+                    result = await asyncio.wait_for(method(), timeout=10)
                     image_url, title, description = result
                     
                     _LOG.info("Live data complete: %s", source_id.upper())
