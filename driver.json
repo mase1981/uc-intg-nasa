@@ -1,0 +1,52 @@
+{
+  "driver_id": "uc_intg_nasa",
+  "version": "0.1.0",
+  "min_core_api": "0.21.0",
+  "name": {
+    "en": "NASA Mission Control"
+  },
+  "description": {
+    "en": "Access live NASA data feeds including Astronomy Picture of the Day, ISS location, Earth imagery, and space weather"
+  },
+  "icon": "uc:earth-americas",
+  "developer": {
+    "name": "Meir Miyara",
+    "email": "meir.miyara@gmail.com",
+    "url": "https://github.com/mase1981/uc-intg-nasa"
+  },
+  "home_page": "https://github.com/mase1981/uc-intg-nasa",
+  "documentation": "https://github.com/mase1981/uc-intg-nasa/blob/main/README.md",
+  "setup_data_schema": {
+    "title": {
+      "en": "NASA Mission Control Configuration"
+    },
+    "settings": [
+      {
+        "id": "api_key",
+        "label": {
+          "en": "NASA API Key"
+        },
+        "field": {
+          "text": {
+            "value": ""
+          }
+        }
+      },
+      {
+        "id": "refresh_interval",
+        "label": {
+          "en": "Refresh Interval (minutes)"
+        },
+        "field": {
+          "number": {
+            "value": 10,
+            "min": 5,
+            "max": 60,
+            "steps": 5
+          }
+        }
+      }
+    ]
+  },
+  "release_date": "2025-08-20"
+}
